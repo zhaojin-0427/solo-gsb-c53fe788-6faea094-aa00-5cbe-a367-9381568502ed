@@ -23,7 +23,13 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.batch import EarlyTimeReject, Report, evaluate_warning  # noqa: E402
+from app.batch import (  # noqa: E402
+    EarlyTimeReject,
+    Report,
+    evaluate_warning,
+    review_warning,
+    subtract_real_intervals,
+)
 from app.model import Waypoint, make_sortie  # noqa: E402
 from app.storage import Store  # noqa: E402
 
@@ -271,12 +277,379 @@ def test_reload_consistency():
         check(w1 == w2, "reloaded batch evaluates identically")
 
 
+def test_report_nodes_and_review():
+    """Accepted writes create review nodes; rejected/idempotent ones don't.
+
+    Each node restores the exact before/after report states; reviews replay
+    both with the same t, intersecting conflict intervals only contribute
+    their changed parts, and early-time rejection covers either side.
+    """
+    sorties = two_crossing_sorties()
+    plan = {"A": 0, "B": 10}
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(os.path.join(d, "t.db"))
+        sid = store.create_scenario({"sorties": []}, 30, 10)
+        bid = store.create_batch(sid, "b", {"sorties": [{"id": "A"}, {"id": "B"}]},
+                                 30, 10, {"offsets": plan})
+        nodes = store.list_report_nodes(bid)
+        check(len(nodes) == 1 and nodes[0]["is_baseline"]
+              and nodes[0]["seq"] == 1 and nodes[0]["before"] == [],
+              "new batch starts with one empty baseline node")
+        check(store.get_report_node(bid, nodes[0]["id"])["after"] == [],
+              "baseline snapshot empty")
+
+        # Accepted write -> node; idempotent retry / conflicts -> no node.
+        store.submit_report(bid, "A", 5, 1)
+        store.submit_report(bid, "A", 5, 1)                       # idempotent
+        store.submit_report(bid, "A", 6, 1)                      # value conflict
+        store.submit_report(bid, "A", 5, 1)                      # idempotent again
+        store.submit_report(bid, "A", 2, 1)                      # value conflict
+        nodes = store.list_report_nodes(bid)
+        check(len(nodes) == 2 and not nodes[1]["is_baseline"]
+              and nodes[1]["seq"] == 2,
+              "only accepted writes create nodes")
+        n1 = nodes[1]
+        check(n1["before"] == [] and n1["after"]
+              == [{"sortie_id": "A", "actual_offset": 5, "revision": 1}],
+              "node snapshots bracket its write exactly")
+        check(n1["trigger_sortie_id"] == "A"
+              and n1["trigger_actual_offset"] == 5
+              and n1["trigger_revision"] == 1,
+              "node names the triggering sortie and revision")
+
+        # Higher revision -> another node chaining on the previous after.
+        store.submit_report(bid, "A", 7, 2)
+        store.submit_report(bid, "A", 7, 1)                      # stale
+        store.submit_report(bid, "B", 3, 2)                      # invalid first rev
+        nodes = store.list_report_nodes(bid)
+        check(len(nodes) == 3 and nodes[2]["before"] == n1["after"]
+              and nodes[2]["after"]
+              == [{"sortie_id": "A", "actual_offset": 7, "revision": 2}],
+              "stale/invalid-first writes create no node; snapshots chain")
+        check(store.get_report_node(bid, 99999) is None,
+              "unknown node id is absent")
+
+    # --- review: B joins its plan slot late, creating one added interval ---
+    before = {"A": Report(0, 1)}
+    after = {"A": Report(0, 1), "B": Report(0, 1)}
+    r = review_warning(sorties, plan, before, after, 30, 10, 0,
+                       trigger={"sortie_id": "B", "actual_offset": 0, "revision": 1})
+    check(r["first_conflict_time_before"] is None
+          and r["first_conflict_time_after"] is not None,
+          "first conflict appears after the node")
+    check(len(r["pair_changes"]) == 1
+          and len(r["pair_changes"][0]["added"]) == 1
+          and not r["pair_changes"][0]["removed"],
+          "one added conflict section, nothing removed")
+    check(r["node"]["sortie_id"] == "B" and r["node"]["revision"] == 1
+          and r["node"]["baseline"] is False,
+          "review names the triggering write")
+    changed = {x["id"]: x for x in r["sortie_changes"]}
+    check(changed["B"]["changed"] and changed["B"]["status_before"] == "planned"
+          and changed["B"]["status_after"] == "reported"
+          and not changed["A"]["changed"],
+          "only the reporting sortie changes")
+    check(r["overdue_added"] == [] and r["overdue_removed"] == [],
+          "no overdue change here")
+
+    # Identical before/after states -> no pair changes at all.
+    r = review_warning(sorties, plan, before, before, 30, 10, 0,
+                       trigger={"sortie_id": "A", "actual_offset": 0, "revision": 1})
+    check(r["pair_changes"] == []
+          and r["first_conflict_time_before"] == r["first_conflict_time_after"],
+          "identical states show no change")
+
+    # Baseline trigger -> baseline flag.
+    r = review_warning(sorties, plan, {}, {}, 30, 10, 0, trigger=None)
+    check(r["node"]["baseline"] is True and r["node"]["sortie_id"] is None,
+          "baseline node flagged")
+
+
+def test_review_overlap_only_changed_parts():
+    """Intersecting before/after intervals surface only their differences."""
+    # Pure interval subtraction.
+    check(subtract_real_intervals([(5, 15)], [(10, 20)]) == [(5, 10)],
+          "overlap keeps the earlier-only section")
+    check(subtract_real_intervals([(5, 15)], [(0, 10)]) == [(10, 15)],
+          "overlap keeps the later-only section")
+    check(subtract_real_intervals([(0, 10)], [(3, 7)]) == [(0, 3), (7, 10)],
+          "contained interval leaves both ends")
+    check(subtract_real_intervals([(3, 4)], [(0, 10)]) == [],
+          "fully covered interval has no changed part")
+    check(subtract_real_intervals([(0, 5)], [(0, 5)]) == [],
+          "identical interval is all overlap, no change")
+
+    # Geometry: B deviates from actual 3 to actual 4 (plan 0).  Before and
+    # after conflict windows with C/D overlap, so the review must report the
+    # non-overlapping heads/tails and never the shared middle.
+    import json
+    payload = json.load(open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "examples", "crossroads.json")))
+    s2 = []
+    for s in payload["sorties"]:
+        wps = [Waypoint(w["x"], w["y"], w["z"], w["t"]) for w in s["waypoints"]]
+        s2.append(make_sortie(s["id"], s["weight"], s["window_hi"], wps, 0))
+    plan2 = {"UAV-A": 4, "UAV-B": 0, "UAV-C": 2, "UAV-D": 6}
+    before = {"UAV-A": Report(4, 1), "UAV-B": Report(3, 1), "UAV-C": Report(2, 1)}
+    after = {"UAV-A": Report(4, 1), "UAV-B": Report(4, 2), "UAV-C": Report(2, 1)}
+    wb = evaluate_warning(s2, plan2, before, 30, 10, 4)
+    wa = evaluate_warning(s2, plan2, after, 30, 10, 4)
+    b_iv = {(c["sortie_a"], c["sortie_b"]): (c["time_start"], c["time_end"])
+            for c in wb["conflicts"]}
+    a_iv = {(c["sortie_a"], c["sortie_b"]): (c["time_start"], c["time_end"])
+            for c in wa["conflicts"]}
+    r = review_warning(s2, plan2, before, after, 30, 10, 4,
+                       trigger={"sortie_id": "UAV-B", "actual_offset": 4,
+                                "revision": 2})
+    check(r["first_conflict_time_before"] != r["first_conflict_time_after"],
+          "first conflict time moves with the revision")
+    by_pair = {(p["sortie_a"], p["sortie_b"]): p for p in r["pair_changes"]}
+    check(set(by_pair) == set(b_iv) == set(a_iv),
+          "every overlapping pair appears once")
+    for key, p in by_pair.items():
+        for seg in p["added"]:
+            check(seg["change"] == "added"
+                  and seg["time_start"] >= b_iv[key][1] - 1e-6,
+                  f"added section starts only after the before interval {key}")
+        for seg in p["removed"]:
+            check(seg["change"] == "removed"
+                  and seg["time_end"] <= a_iv[key][0] + 1e-6,
+                  f"removed section ends before the after interval {key}")
+        # Shared interior must not appear in either list.
+        lo = max(b_iv[key][0], a_iv[key][0])
+        hi = min(b_iv[key][1], a_iv[key][1])
+        for seg in p["added"] + p["removed"]:
+            check(not (seg["time_start"] >= lo - 1e-6
+                       and seg["time_end"] <= hi + 1e-6),
+                  f"overlapping middle of {key} is not marked as change")
+
+
+def test_review_rejects_on_either_side():
+    sorties = two_crossing_sorties()
+    plan = {"A": 0, "B": 10}
+    # Before has a future take-off (9) while the correction moves back to 0:
+    # t=3 is earlier than the BEFORE side's reported take-off -> whole review
+    # rejected, no diff.
+    try:
+        review_warning(sorties, plan,
+                       {"A": Report(9, 1)}, {"A": Report(0, 2)}, 30, 10, 3,
+                       trigger={"sortie_id": "A", "actual_offset": 0, "revision": 2})
+        check(False, "review must reject when t precedes a before-side take-off")
+    except EarlyTimeReject as exc:
+        check([v["sortie_id"] for v in exc.violations] == ["A"],
+              "rejection names the violating sortie from either side")
+    # And vice versa: after side in the future is rejected just as well.
+    try:
+        review_warning(sorties, plan,
+                       {"A": Report(0, 1)}, {"A": Report(9, 2)}, 30, 10, 3,
+                       trigger={"sortie_id": "A", "actual_offset": 9, "revision": 2})
+        check(False, "review must reject when t precedes an after-side take-off")
+    except EarlyTimeReject:
+        pass
+
+
+def test_review_overdue_change():
+    sorties = two_crossing_sorties()
+    plan = {"A": 0, "B": 10}
+    # At t=5 nothing is reported: A (plan 0) overdue.  After A reports actual
+    # 0 it becomes reported; B stays planned (plan 10 >= t).
+    r = review_warning(sorties, plan, {}, {"A": Report(0, 1)}, 30, 10, 5,
+                       trigger={"sortie_id": "A", "actual_offset": 0, "revision": 1})
+    check(r["overdue_before"] == ["A"] and r["overdue_after"] == []
+          and r["overdue_removed"] == ["A"] and r["overdue_added"] == [],
+          "reporting an overdue sortie clears overdue on the after side")
+    check(r["complete_before"] is False and r["complete_after"] is True,
+          "completeness flips with the overdue set")
+
+
+def test_upgrade_baseline_backfill():
+    """A database created before nodes existed gets exactly one baseline per
+    batch, capturing the latest state knowable at upgrade time."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.db")
+        old = Store(path)
+        sid = old.create_scenario({"sorties": []}, 30, 10)
+        # Simulate a database written by a pre-feature release: insert the
+        # batch and its report rows directly, bypassing the node table, then
+        # delete any baseline so the batch has ZERO nodes (the exact shape an
+        # upgrade finds on disk).
+        import sqlite3
+        import time
+        with sqlite3.connect(path) as c:
+            now = time.time()
+            c.execute(
+                "INSERT INTO batches(scenario_id,name,input_json,safety_radius,"
+                "safety_height,plan_json,created_at) VALUES (?,?,?,?,?,?,?)",
+                (sid, "old", '{"sorties":[{"id":"A"}]}', 30.0, 10.0,
+                 '{"offsets":{"A":1}}', now))
+            old_bid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            c.execute(
+                "INSERT INTO batch_reports(batch_id,sortie_id,actual_offset,"
+                "revision,reported_at) VALUES (?,?,?,?,?)",
+                (old_bid, "A", 8, 2, now))
+            c.execute("DELETE FROM batch_report_nodes")
+
+        reopened = Store(path)  # runs the idempotent backfill
+        nodes = reopened.list_report_nodes(old_bid)
+        check(len(nodes) == 1 and nodes[0]["is_baseline"]
+              and nodes[0]["before"] == nodes[0]["after"]
+              == [{"sortie_id": "A", "actual_offset": 8, "revision": 2}],
+              "upgraded batch gets one baseline at the newest known state, "
+              "no fabricated earlier history")
+        # Backfill is idempotent: another open must not duplicate baselines.
+        Store(path)
+        check(len(Store(path).list_report_nodes(old_bid)) == 1,
+              "baseline backfill runs once")
+
+
+def test_concurrent_nodes_follow_commit_order():
+    """Racing accepted writes from threads and processes: one node per
+    accepted write, seq contiguous, snapshots chain from the prior after, and
+    replaying nodes reproduces the final report state.
+
+    Under the revision protocol a lower revision is still rejected when a
+    higher one committed first, so the accepted revision set is 1 plus the
+    record highs in actual commit order.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(os.path.join(d, "t.db"))
+        sid = store.create_scenario({"sorties": []}, 30, 10)
+        bid = store.create_batch(sid, "seq", {"sorties": [{"id": "A"}]},
+                                 30, 10, {"offsets": {"A": 0}})
+        # Strictly increasing submissions: every write accepted, node chain
+        # reproduces the whole history in commit order.
+        for rev in range(1, 9):
+            o, _ = store.submit_report(bid, "A", 10 * rev, rev)
+            check(o == "inserted", "sequential increasing revisions accepted")
+        nodes = store.list_report_nodes(bid)
+        check([n["seq"] for n in nodes] == list(range(1, 10)),
+              "sequential chain: contiguous seq 1..9")
+        acc = nodes[1:]
+        check([n["trigger_revision"] for n in acc] == list(range(1, 9)),
+              "sequential nodes follow commit order 1..8")
+        for prev, cur in zip(nodes, nodes[1:]):
+            check(prev["after"] == cur["before"], "sequential snapshots chain")
+        check(nodes[-1]["after"]
+              == [{"sortie_id": "A", "actual_offset": 80, "revision": 8}],
+              "sequential replay ends at highest revision")
+
+        # Truly concurrent revisions in ONE batch: every accepted write gets
+        # exactly one node in commit order; rejected stale writes get none;
+        # the chain always replays to the highest committed revision.
+        for trial in range(10):
+            bid = store.create_batch(sid, f"b{trial}", {"sorties": [{"id": "A"}]},
+                                     30, 10, {"offsets": {"A": 0}})
+            barrier = threading.Barrier(8)
+            results = []
+            lock = threading.Lock()
+
+            def put(rev):
+                barrier.wait()
+                o, _ = store.submit_report(bid, "A", 10 * rev, rev)
+                with lock:
+                    results.append((rev, o))
+
+            ts = [threading.Thread(target=put, args=(r,)) for r in range(1, 9)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            nodes = store.list_report_nodes(bid)
+            accepted = sorted(rev for rev, o in results if o == "inserted")
+            check([n["seq"] for n in nodes] == list(range(1, len(nodes) + 1)),
+                  f"trial {trial}: contiguous node seq")
+            nodes_acc = nodes[1:]
+            check(all(not n["is_baseline"] for n in nodes_acc), "no stray baselines")
+            check(len(nodes_acc) == len(accepted),
+                  f"trial {trial}: one node per accepted write "
+                  f"({len(nodes_acc)} nodes vs {len(accepted)} accepts)")
+            check(sorted(n["trigger_revision"] for n in nodes_acc) == accepted,
+                  f"trial {trial}: node revisions match accepted writes")
+            node_revs = [n["trigger_revision"] for n in nodes_acc]
+            check(node_revs == sorted(node_revs) and node_revs[-1] == max(accepted),
+                  f"trial {trial}: commit order ends at highest accepted, "
+                  f"got {node_revs}")
+            for prev, cur in zip(nodes, nodes[1:]):
+                check(prev["after"] == cur["before"],
+                      f"trial {trial}: snapshots chain at seq {cur['seq']}")
+            top = max(accepted)
+            check(nodes[-1]["after"]
+                  == [{"sortie_id": "A", "actual_offset": 10 * top,
+                       "revision": top}],
+                  f"trial {trial}: replay ends at highest accepted revision")
+
+    # Cross-process: two processes racing rev 2/3.  Rev 3 always wins; rev 2
+    # is a node only when it serializes before rev 3.  Whatever the order,
+    # reloaded nodes are identical and replay to the highest revision.
+    import multiprocessing as mp
+    ctx = mp.get_context("fork")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.db")
+        setup = Store(path)
+        sid = setup.create_scenario({"sorties": []}, 30, 10)
+        for trial in range(8):
+            bid = setup.create_batch(sid, f"mp{trial}", {"sorties": [{"id": "A"}]},
+                                     30, 10, {"offsets": {"A": 0}})
+            setup.submit_report(bid, "A", 10, 1)
+            barrier = ctx.Barrier(2)
+            queue = ctx.Queue()
+            procs = [
+                ctx.Process(target=_node_worker,
+                            args=(path, bid, off, rev, barrier, queue))
+                for off, rev in ((20, 2), (30, 3))]
+            for p in procs:
+                p.start()
+            worker_outcomes = [queue.get(timeout=30) for _ in procs]
+            for p in procs:
+                p.join(10)
+            nodes = setup.list_report_nodes(bid)
+            revs = [n["trigger_revision"] for n in nodes[2:]]
+            # rev 3 is always present; rev 2 only when it committed first.
+            check(revs[-1] == 3 and sorted(set(revs)) == revs
+                  and (revs == [3] or revs == [2, 3]),
+                  f"mp{trial}: nodes follow commit order, highest=3, got {revs}")
+            # baseline + seeded rev1 (one each) + one node per raced insert.
+            check(len(nodes) == 2 + sum(1 for o in worker_outcomes
+                                        if o == "inserted"),
+                  f"mp{trial}: node count equals accepted writes, "
+                  f"{worker_outcomes} vs {revs}")
+            check(any(o == "stale_revision" for o in worker_outcomes)
+                  or all(o == "inserted" for o in worker_outcomes),
+                  f"mp{trial}: loser (if any) is stale and creates no node, "
+                  f"got {worker_outcomes}")
+            check(nodes[-1]["after"]
+                  == [{"sortie_id": "A", "actual_offset": 30, "revision": 3}],
+                  f"mp{trial}: final node snapshot is the highest revision")
+            for prev, cur in zip(nodes, nodes[1:]):
+                check(prev["after"] == cur["before"],
+                      f"mp{trial}: cross-process snapshots chain")
+            # Reload from a fresh Store and confirm identical replay.
+            reloaded = Store(path).list_report_nodes(bid)
+            check([(n["seq"], n["before"], n["after"]) for n in reloaded]
+                  == [(n["seq"], n["before"], n["after"]) for n in nodes],
+                  f"mp{trial}: reloaded nodes identical")
+
+
+def _node_worker(path, bid, off, rev, barrier, queue):
+    store = Store(path)
+    barrier.wait()
+    outcome, _ = store.submit_report(bid, "A", off, rev)
+    queue.put(outcome)
+
+
 def main():
     test_evaluation()
     test_store_revision_protocol()
     test_concurrent_keeps_highest()
     test_multiprocess_shared_db()
     test_reload_consistency()
+    test_report_nodes_and_review()
+    test_review_overlap_only_changed_parts()
+    test_review_rejects_on_either_side()
+    test_review_overdue_change()
+    test_upgrade_baseline_backfill()
+    test_concurrent_nodes_follow_commit_order()
     print("failures:", FAILS)
     return FAILS
 

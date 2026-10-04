@@ -86,6 +86,19 @@
         <div id="warnSummary" class="warn-summary"></div>
         <div id="warnSorties" class="warn-sorties"></div>
         <div id="warnConflicts" class="warn-conflicts"></div>
+
+        <div class="rv-block">
+          <div class="rv-title">预警变更复盘</div>
+          <div class="hint">选择一次已接受的上报节点，用与预警相同的当前秒 t，复盘该上报前后的预警变化。同号同值重试与被拒绝的旧号不生成节点。</div>
+          <div class="row" style="margin:6px 0">
+            <label>复盘节点</label>
+            <div class="t-row">
+              <select id="reviewNode" class="rv-select"></select>
+              <button id="reviewBtn">复盘（用上方 t）</button>
+            </div>
+          </div>
+          <div id="reviewBox" class="review-box"></div>
+        </div>
       </div>
     </section>
   </aside>

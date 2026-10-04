@@ -21,6 +21,11 @@ batches and then exercises the revision protocol *across the two processes*:
   repeated several times - the stored row must always end at revision 3;
 * case D: two simultaneous first reports (revision 1, same value) - exactly
   one insert and one idempotent retry.
+* review nodes: every accepted write above gets exactly one node (idempotent
+  and rejected writes get none), visible in the same commit order from both
+  processes; the node's before/after snapshots replay to the stored state and
+  a review reloaded from either process returns identical first-conflict
+  deltas; an unknown node returns 404.
 
 After every case it reloads the batch (and its warning) from BOTH processes
 and checks they show the highest revision's actual offset. Exits non-zero on
@@ -122,6 +127,17 @@ def warning_row(base, bid, t):
     return {r["id"]: r for r in body["warning"]["sorties"]}["UAV-A"]
 
 
+def report_nodes(base, bid):
+    status, body = call("GET", base, f"/api/batches/{bid}/report-nodes")
+    assert status == 200, (status, body)
+    return body["nodes"]
+
+
+def review(base, bid, node_id, t):
+    return call("GET", base,
+                f"/api/batches/{bid}/report-nodes/{node_id}/review?t={t}")
+
+
 def race(bid, offers):
     """offers: list of (base, offset, revision); release at the same instant."""
     start = threading.Barrier(len(offers))
@@ -216,6 +232,84 @@ def main():
     rep = stored_report(BASE2, db, "UAV-A")
     check(rep is not None and rep["revision"] == 1 and rep["actual_offset"] == 7,
           f"D: single rev 1 / offset 7 row visible on process 2 -> {rep}")
+
+    # --- review nodes across the two processes -----------------------------
+    # Case A had accepted writes rev1 then rev3 (rev2 was rejected): the
+    # baseline + exactly two trigger nodes, no node for the stale rev2.
+    for base in (BASE1, BASE2):
+        nodes = report_nodes(base, bid_a)
+        triggers = [(n["trigger_sortie_id"], n["trigger_revision"],
+                     n["trigger_actual_offset"]) for n in nodes if not n["is_baseline"]]
+        check(nodes[0]["is_baseline"] and nodes[0]["seq"] == 1,
+              f"A: node chain starts with baseline (via {base}) -> {nodes}")
+        check(triggers == [("UAV-A", 1, 7), ("UAV-A", 3, 9)],
+              f"A: one node per accepted write in commit order (via {base}) "
+              f"-> {triggers}")
+
+    # Case B's chain (rev1, rev2, rev3): reviewing the rev3 node at t=9 must
+    # succeed from BOTH processes with identical before/after first-conflict
+    # times and an idempotent reload.
+    nodes_b = report_nodes(BASE1, bid_b)
+    rev3_node = [n for n in nodes_b
+                 if n["trigger_sortie_id"] == "UAV-A"
+                 and n["trigger_revision"] == 3][0]
+    reviews = {}
+    for base in (BASE1, BASE2):
+        status, body = review(base, bid_b, rev3_node["node_id"], 9)
+        check(status == 200, f"review rev3 node via {base} (HTTP {status})")
+        r = body["review"]
+        check(r["node"]["sortie_id"] == "UAV-A" and r["node"]["revision"] == 3
+              and r["node"]["actual_offset"] == 9,
+              f"review names the triggering write (via {base})")
+        check(r["warning_before"]["sorties"] and r["warning_after"]["sorties"],
+              f"review restores full before/after states (via {base})")
+        reviews[base] = (r["first_conflict_time_before"],
+                         r["first_conflict_time_after"],
+                         [(p["sortie_a"], p["sortie_b"],
+                           tuple((x["change"], x["time_start"], x["time_end"])
+                                 for x in p["added"] + p["removed"]))
+                          for p in r["pair_changes"]])
+    check(reviews[BASE1] == reviews[BASE2],
+          f"review identical across processes / reloads -> {reviews}")
+
+    # Re-review returns byte-identical content on repeat (determinism).
+    s1, b1 = review(BASE1, bid_b, rev3_node["node_id"], 9)
+    s2, b2 = review(BASE1, bid_b, rev3_node["node_id"], 9)
+    check(s1 == s2 == 200 and b1 == b2, "repeated review is deterministic")
+
+    # The raced case C: however rev2/rev3 committed, nodes exist only for the
+    # writes that actually inserted, strictly ordered, final snapshot rev3.
+    for trial in range(5):
+        cb_id = new_batch(sid, f"caseC-node-{trial}")
+        report(BASE1, cb_id, "UAV-A", 7, 1)
+        race(cb_id, [(BASE1, 9, 3), (BASE2, 8, 2)])
+        nodes = report_nodes(BASE1, cb_id)
+        revs = [n["trigger_revision"] for n in nodes if not n["is_baseline"]]
+        check(revs[0] == 1 and revs[-1] == 3
+              and (revs == [1, 3] or revs == [1, 2, 3]),
+              f"C{trial}: nodes follow actual commit order -> {revs}")
+        if revs == [1, 3]:
+            # rev2 lost the race: verify it really created no node (same as
+            # its 409 stale response).
+            check(any(n["trigger_revision"] == 2 for n in nodes) is False,
+                  f"C{trial}: rejected stale rev2 left no node")
+        # Every committed node replays from process 1 with both states.
+        for n in nodes[1:]:
+            status, body = review(BASE1, cb_id, n["node_id"], 9)
+            check(status == 200
+                  and "warning_before" in body.get("review", {})
+                  and "warning_after" in body.get("review", {}),
+                  f"C{trial}: node rev{n['trigger_revision']} review replays "
+                  f"both states (HTTP {status})")
+        rep = stored_report(BASE2, cb_id, "UAV-A")
+        check(rep["revision"] == 3 and rep["actual_offset"] == 9,
+              f"C{trial}: stored row still highest revision")
+
+    # Unknown node -> 404; unknown batch -> 404.
+    status, _ = review(BASE1, bid_b, 999999, 9)
+    check(status == 404, f"unknown review node -> 404 (got {status})")
+    status, _ = call("GET", BASE1, "/api/batches/999999/report-nodes")
+    check(status == 404, f"unknown batch node list -> 404 (got {status})")
 
     print()
     if FAILURES:

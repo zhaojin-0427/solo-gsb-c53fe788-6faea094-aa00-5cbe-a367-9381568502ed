@@ -22,6 +22,8 @@ const state = {
   batch: null,           // currently open batch summary + warning
   warning: null,
   warningSorties: {},    // latest warning rows keyed by sortie id
+  reviewNodes: [],       // accepted report nodes (incl. baseline) for the open batch
+  review: null,          // last warning-change review result
 };
 
 const $ = (id) => document.getElementById(id);
@@ -80,6 +82,8 @@ function loadScenarioDto(dto) {
   state.batch = null;
   state.warning = null;
   state.warningSorties = {};
+  state.review = null;
+  state.reviewNodes = [];
   state.sorties.forEach((s) => colorFor(s.id));
   $("safetyRadius").value = dto.safety_radius;
   $("safetyHeight").value = dto.safety_height;
@@ -691,11 +695,24 @@ async function openBatch(bid) {
     state.batch = b;
     state.warning = null;
     state.warningSorties = {};
+    state.review = null;
     renderBatchList();
     renderBatchDetail();
+    await fetchReviewNodes();
   } catch (e) {
     toast("载入批次失败：" + e.message);
   }
+}
+
+async function fetchReviewNodes() {
+  if (!state.batch) return;
+  try {
+    const d = await api(`/api/batches/${state.batch.batch_id}/report-nodes`);
+    state.reviewNodes = d.nodes || [];
+  } catch (e) {
+    state.reviewNodes = [];
+  }
+  renderReviewNodes();
 }
 
 async function deleteBatch(bid) {
@@ -705,6 +722,8 @@ async function deleteBatch(bid) {
     state.batch = null;
     state.warning = null;
     state.warningSorties = {};
+    state.review = null;
+    state.reviewNodes = [];
   }
   toast("批次已删除");
   await fetchBatches();
@@ -859,6 +878,112 @@ function renderBatchDetail() {
 }
 
 // ---------------------------------------------------------------------------
+// Warning-change review around one accepted report node
+// ---------------------------------------------------------------------------
+
+function nodeLabel(n) {
+  if (n.is_baseline) {
+    return `#${n.seq} 基线节点（升级时最新状态 / 空状态）`;
+  }
+  return `#${n.seq} ${escapeHtml(n.trigger_sortie_id)} 实际 ${n.trigger_actual_offset}s · 修订 ${n.trigger_revision}`;
+}
+
+function renderReviewNodes() {
+  const sel = $("reviewNode");
+  if (!sel) return;
+  const keep = sel.value;
+  sel.innerHTML = "";
+  // Users pick an *accepted report node*; the baseline is an internal replay
+  // anchor (still available via the HTTP API).
+  const selectable = state.reviewNodes.filter((n) => !n.is_baseline);
+  if (!selectable.length) {
+    sel.innerHTML = `<option value="">（暂无已接受的上报节点）</option>`;
+    return;
+  }
+  for (const n of selectable) {
+    const opt = document.createElement("option");
+    opt.value = String(n.node_id);
+    opt.textContent = nodeLabel(n);
+    sel.appendChild(opt);
+  }
+  if (keep && state.reviewNodes.some((n) => String(n.node_id) === keep)) sel.value = keep;
+}
+
+function renderReview() {
+  const box = $("reviewBox");
+  if (!box) return;
+  if (!state.review) { box.innerHTML = ""; return; }
+  const r = state.review;
+  const node = r.node;
+  const head = node.baseline
+    ? `<div class="rv-node">基线节点（${r.t}s 评估，无触发上报）</div>`
+    : `<div class="rv-node">触发上报：${escapeHtml(node.sortie_id)} 实际 ${node.actual_offset}s · 修订 ${node.revision}</div>`;
+
+  const fc = (v) => (v === null ? '<span class="rv-nodiff">无冲突</span>' : `${v} s`);
+  const firstLine = `<div>首个冲突时刻：前 ${fc(r.first_conflict_time_before)} → 后 ${fc(r.first_conflict_time_after)}</div>`;
+
+  const overParts = [];
+  if (r.overdue_removed.length)
+    overParts.push(`<span class="rv-over-removed">解除逾期：${r.overdue_removed.map(escapeHtml).join("、") || "无"}</span>`);
+  if (r.overdue_added.length)
+    overParts.push(`<span class="rv-over-added">新增逾期：${r.overdue_added.map(escapeHtml).join("、") || "无"}</span>`);
+  if (!overParts.length) overParts.push(`<span class="rv-nodiff">逾期集合无变化（前：${r.overdue_before.map(escapeHtml).join("、") || "无"}）</span>`);
+  const overLine = `<div class="rv-over">${overParts.join("；")}</div>`;
+
+  const chips = r.sortie_changes.map((s) => {
+    const tag = s.changed ? "changed" : "";
+    const tail = s.changed
+      ? `${s.takeoff_offset_before ?? "—"}→${s.takeoff_offset_after ?? "—"}s${s.revision_after ? `（修${s.revision_before ?? 0}→${s.revision_after}）` : ""}`
+      : `${statusLabel(s.status_after)} ${s.takeoff_offset_after ?? "—"}s`;
+    return `<span class="rv-chip ${tag}">${escapeHtml(s.id)}：${tail}</span>`;
+  }).join("");
+
+  let pairsHtml;
+  if (!r.pair_changes.length) {
+    pairsHtml = `<div class="rv-nodiff">冲突区间集合无变化（相交区间只显示变化部分，完全相同不列出）。</div>`;
+  } else {
+    pairsHtml = r.pair_changes.map((p) => {
+      const segHtml = (seg, cls, label) => seg.map((x) =>
+        `<div class="rv-seg ${cls}">${label} [${x.time_start}, ${x.time_end}] s（见证 ${x.witness_time} s）</div>`).join("");
+      return `<div class="rv-pair">
+        <div class="rv-pair-head">${escapeHtml(p.sortie_a)} ↔ ${escapeHtml(p.sortie_b)}</div>
+        ${segHtml(p.added, "added", "🔺 新增冲突")}
+        ${segHtml(p.removed, "removed", "🟢 解除冲突")}
+      </div>`;
+    }).join("");
+  }
+
+  box.innerHTML = `${head}
+    <div>当前秒 t = ${r.t}；预测完整性：前 ${r.complete_before ? "完整" : "不完整"} → 后 ${r.complete_after ? "完整" : "不完整"}</div>
+    ${firstLine}
+    ${overLine}
+    <div class="rv-sorties">${chips}</div>
+    ${pairsHtml}`;
+}
+
+async function evaluateReview() {
+  if (!state.batch) return;
+  const t = parseInt($("warnT").value, 10);
+  if (!Number.isInteger(t) || t < 0) {
+    toast("t 必须是非负整数秒");
+    return;
+  }
+  const nodeId = $("reviewNode").value;
+  if (!nodeId) { toast("暂无可复盘节点"); return; }
+  try {
+    const d = await api(`/api/batches/${state.batch.batch_id}/report-nodes/${nodeId}/review?t=${t}`);
+    state.review = d.review;
+    renderReview();
+  } catch (e) {
+    state.review = null;
+    renderReview();
+    // Same rule as the live warning: t earlier than either side's reported
+    // actual take-off rejects the whole review without a difference.
+    toast("复盘被拒绝（t 早于上报的实际起飞时刻，不返回差异）：" + e.message, 4200);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
 
@@ -904,6 +1029,7 @@ $("closeResult").addEventListener("click", () => $("resultPanel").classList.add(
 
 $("createBatchBtn").addEventListener("click", createBatch);
 $("evalWarnBtn").addEventListener("click", evaluateWarning);
+$("reviewBtn").addEventListener("click", evaluateReview);
 $("warnT").addEventListener("keydown", (e) => { if (e.key === "Enter") evaluateWarning(); });
 $("batchDel").addEventListener("click", () => {
   if (state.batch) deleteBatch(state.batch.batch_id);

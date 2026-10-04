@@ -25,7 +25,7 @@ from .solver import (
     run_solve,
     scan_schedule,
 )
-from .batch import EarlyTimeReject, Report, evaluate_warning
+from .batch import EarlyTimeReject, Report, evaluate_warning, review_warning
 from .storage import Store
 
 DB_PATH = os.environ.get("DCC_DB_PATH", "data/console.db")
@@ -325,6 +325,76 @@ def batch_warning(bid: int, t: int):
         )
     summary = _batch_summary(row)
     return {**summary, "warning": result}
+
+
+def _reports_from_snapshot(snapshot: list[dict]) -> dict[str, Report]:
+    return {
+        item["sortie_id"]: Report(item["actual_offset"], item["revision"])
+        for item in snapshot
+    }
+
+
+def _node_dto(node: dict) -> dict:
+    return {
+        "node_id": node["id"],
+        "seq": node["seq"],
+        "created_at": node["created_at"],
+        "is_baseline": node["is_baseline"],
+        "trigger_sortie_id": node["trigger_sortie_id"],
+        "trigger_actual_offset": node["trigger_actual_offset"],
+        "trigger_revision": node["trigger_revision"],
+    }
+
+
+@app.get("/api/batches/{bid}/report-nodes")
+def list_report_nodes(bid: int):
+    row = store.get_batch(bid)
+    if row is None:
+        raise HTTPException(404, "batch not found")
+    return {"batch_id": bid, "nodes": [_node_dto(n) for n in store.list_report_nodes(bid)]}
+
+
+@app.get("/api/batches/{bid}/report-nodes/{node_id}/review")
+def review_report_node(bid: int, node_id: int, t: int):
+    row = store.get_batch(bid)
+    if row is None:
+        raise HTTPException(404, "batch not found")
+    if t < 0:
+        raise HTTPException(400, "t must be a non-negative integer second")
+    node = store.get_report_node(bid, node_id)
+    if node is None:
+        raise HTTPException(404, "report node not found")
+    sorties, _ = _build_batch(row)
+    before = _reports_from_snapshot(node["before"])
+    after = _reports_from_snapshot(node["after"])
+    trigger = None
+    if not node["is_baseline"]:
+        trigger = {
+            "sortie_id": node["trigger_sortie_id"],
+            "actual_offset": node["trigger_actual_offset"],
+            "revision": node["trigger_revision"],
+        }
+    try:
+        result = review_warning(
+            sorties, row["plan"]["offsets"], before, after,
+            row["safety_radius"], row["safety_height"], t, trigger)
+    except EarlyTimeReject as exc:
+        raise HTTPException(
+            400,
+            detail={
+                "reason": "t_before_reported_takeoff",
+                "t": t,
+                "violations": exc.violations,
+            },
+        )
+    return {
+        "batch_id": bid,
+        "node": {**_node_dto(node),
+                 "sortie_id": node["trigger_sortie_id"],
+                 "actual_offset": node["trigger_actual_offset"],
+                 "revision": node["trigger_revision"]},
+        "review": result,
+    }
 
 
 @app.get("/api/health")

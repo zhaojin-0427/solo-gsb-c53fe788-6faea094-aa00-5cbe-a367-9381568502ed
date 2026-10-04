@@ -55,6 +55,28 @@ CREATE TABLE IF NOT EXISTS batch_reports (
     reported_at     REAL NOT NULL,
     PRIMARY KEY (batch_id, sortie_id)
 );
+
+-- One row per *accepted* report write ("node").  Each node stores the FULL
+-- report state immediately before and immediately after its write, so a
+-- warning-change review is a pure replay of two committed snapshots.  The
+-- node row is inserted in the same BEGIN IMMEDIATE transaction as the report
+-- write it describes; therefore, even with several processes sharing the
+-- file, report writes and review nodes correspond atomically and the per-batch
+-- seq order is exactly the database commit order.  A NULL trigger marks the
+-- baseline node (an empty state for new batches, or the latest state visible
+-- at upgrade time for batches created before this feature existed).
+CREATE TABLE IF NOT EXISTS batch_report_nodes (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id                INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    seq                     INTEGER NOT NULL,
+    trigger_sortie_id       TEXT,
+    trigger_actual_offset   INTEGER,
+    trigger_revision        INTEGER,
+    before_json             TEXT NOT NULL,
+    after_json              TEXT NOT NULL,
+    created_at              REAL NOT NULL,
+    UNIQUE (batch_id, seq)
+);
 """
 
 
@@ -81,11 +103,43 @@ class Store:
                     c.execute("PRAGMA journal_mode=WAL")
                     c.execute("PRAGMA synchronous=NORMAL")
                     c.executescript(_SCHEMA)
-                    return
+                    break
                 except sqlite3.OperationalError as exc:
                     if "locked" not in str(exc) or attempt == _BUSY_ATTEMPTS - 1:
                         raise
             time.sleep(_BUSY_WAIT_SECONDS)
+        # Backfill review baselines for batches that existed before the node
+        # table.  Existing batches only get a single baseline node describing
+        # the newest state knowable at upgrade time - earlier history is never
+        # fabricated.  Idempotent and serialized via the write transaction.
+        self._backfill_baselines()
+
+    @staticmethod
+    def _snapshot(c, batch_id: int) -> str:
+        """Full per-batch report state as deterministic JSON (sortie id sorted)."""
+        rows = c.execute(
+            "SELECT sortie_id,actual_offset,revision FROM batch_reports "
+            "WHERE batch_id=? ORDER BY sortie_id",
+            (batch_id,)).fetchall()
+        return json.dumps([dict(r) for r in rows], ensure_ascii=False,
+                          sort_keys=True)
+
+    def _backfill_baselines(self) -> None:
+        with self._write_tx() as c:
+            rows = c.execute(
+                "SELECT b.id FROM batches b WHERE NOT EXISTS ("
+                "SELECT 1 FROM batch_report_nodes n WHERE n.batch_id = b.id)"
+            ).fetchall()
+            now = time.time()
+            for r in rows:
+                bid = r["id"]
+                snap = self._snapshot(c, bid)
+                c.execute(
+                    "INSERT INTO batch_report_nodes"
+                    "(batch_id,seq,trigger_sortie_id,trigger_actual_offset,"
+                    "trigger_revision,before_json,after_json,created_at) "
+                    "VALUES (?,1,NULL,NULL,NULL,?,?,?)",
+                    (bid, snap, snap, now))
 
     def _conn(self):
         conn = sqlite3.connect(
@@ -166,8 +220,11 @@ class Store:
 
     def delete_scenario(self, scenario_id: int) -> bool:
         with self._write_tx() as c:
-            # Remove dependent batches (and their reports) explicitly so the
-            # cascade works even on databases created before the FK cascade.
+            # Remove dependent batches (and their reports/nodes) explicitly so
+            # the cascade works even on databases created before the FK cascade.
+            c.execute("DELETE FROM batch_report_nodes WHERE batch_id IN "
+                      "(SELECT id FROM batches WHERE scenario_id=?)",
+                      (scenario_id,))
             c.execute("DELETE FROM batch_reports WHERE batch_id IN "
                       "(SELECT id FROM batches WHERE scenario_id=?)",
                       (scenario_id,))
@@ -183,14 +240,25 @@ class Store:
                      safety_radius: float, safety_height: float,
                      plan: dict) -> int:
         with self._write_tx() as c:
+            now = time.time()
             cur = c.execute(
                 "INSERT INTO batches(scenario_id,name,input_json,safety_radius,"
                 "safety_height,plan_json,created_at) VALUES (?,?,?,?,?,?,?)",
                 (scenario_id, name, json.dumps(input_payload, ensure_ascii=False),
                  float(safety_radius), float(safety_height),
-                 json.dumps(plan, ensure_ascii=False), time.time()),
+                 json.dumps(plan, ensure_ascii=False), now),
             )
-            return int(cur.lastrowid)
+            bid = int(cur.lastrowid)
+            # Baseline node (seq 1): the empty report state before any
+            # accepted write. Created in the same transaction as the batch,
+            # so every batch always has a replay chain starting at seq 1.
+            c.execute(
+                "INSERT INTO batch_report_nodes"
+                "(batch_id,seq,trigger_sortie_id,trigger_actual_offset,"
+                "trigger_revision,before_json,after_json,created_at) "
+                "VALUES (?,1,NULL,NULL,NULL,'[]','[]',?)",
+                (bid, now))
+            return bid
 
     def list_batches(self, scenario_id: int | None = None) -> list[dict]:
         sql = ("SELECT b.id,b.scenario_id,b.name,b.safety_radius,b.safety_height,"
@@ -259,6 +327,12 @@ class Store:
         """
         with self._write_tx() as c:
             now = time.time()
+            # The review node must describe the exact state transition
+            # performed by THIS committed transaction, so the "before"
+            # snapshot is taken inside it (after BEGIN IMMEDIATE, all prior
+            # writers have committed) and the node is written in the same
+            # commit as the report write.
+            before_snapshot = self._snapshot(c, batch_id)
             # 1) First report only: create the row when none exists AND the
             #    incoming revision is 1.
             cur = c.execute(
@@ -280,6 +354,21 @@ class Store:
                 )
                 wrote = cur.rowcount > 0
             if wrote:
+                after_snapshot = self._snapshot(c, batch_id)
+                # seq follows the per-batch node count; committed
+                # transactions serialise on the write lock, so this order is
+                # exactly the actual submission (commit) order, even across
+                # processes sharing the file.
+                seq = int(c.execute(
+                    "SELECT COUNT(*) AS n FROM batch_report_nodes WHERE batch_id=?",
+                    (batch_id,)).fetchone()["n"]) + 1
+                c.execute(
+                    "INSERT INTO batch_report_nodes"
+                    "(batch_id,seq,trigger_sortie_id,trigger_actual_offset,"
+                    "trigger_revision,before_json,after_json,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (batch_id, seq, sortie_id, int(actual_offset),
+                     int(revision), before_snapshot, after_snapshot, now))
                 return "inserted", {"sortie_id": sortie_id,
                                     "actual_offset": int(actual_offset),
                                     "revision": int(revision)}
@@ -301,3 +390,36 @@ class Store:
                                       "actual_offset": cur_off,
                                       "revision": cur_rev}
             return "stale_revision", {"current_revision": cur_rev}
+
+    # ------------------------------------------------------------------
+    # Report nodes (accepted-write events) for warning-change reviews
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _node_row(r) -> dict:
+        return {
+            "id": r["id"],
+            "batch_id": r["batch_id"],
+            "seq": r["seq"],
+            "created_at": r["created_at"],
+            "trigger_sortie_id": r["trigger_sortie_id"],
+            "trigger_actual_offset": r["trigger_actual_offset"],
+            "trigger_revision": r["trigger_revision"],
+            "is_baseline": r["trigger_sortie_id"] is None,
+            "before": json.loads(r["before_json"]),
+            "after": json.loads(r["after_json"]),
+        }
+
+    def list_report_nodes(self, batch_id: int) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM batch_report_nodes WHERE batch_id=? ORDER BY seq",
+                (batch_id,)).fetchall()
+        return [self._node_row(r) for r in rows]
+
+    def get_report_node(self, batch_id: int, node_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM batch_report_nodes WHERE batch_id=? AND id=?",
+                (batch_id, node_id)).fetchone()
+        return self._node_row(row) if row is not None else None

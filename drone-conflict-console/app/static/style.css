@@ -196,6 +196,35 @@ canvas {
 }
 .batch-item.active { border-color: var(--accent); }
 
+/* warning-change review */
+.rv-block {
+  margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px;
+}
+.rv-title { font-weight: 700; font-size: 13px; color: #cdd9f0; margin-bottom: 4px; }
+.rv-select {
+  flex: 1; background: #0e1525; color: var(--text);
+  border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px;
+}
+.review-box { font-size: 12px; display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.rv-node { color: var(--accent); font-weight: 600; }
+.rv-nodiff { color: var(--muted); }
+.rv-over-added { color: var(--bad); }
+.rv-over-removed { color: var(--ok); }
+.rv-pair {
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 7px;
+  padding: 5px 8px;
+}
+.rv-pair-head { font-weight: 600; margin-bottom: 3px; }
+.rv-seg { font-variant-numeric: tabular-nums; padding-left: 8px; }
+.rv-seg.added { color: var(--bad); }
+.rv-seg.removed { color: var(--ok); }
+.rv-sorties { display: flex; flex-wrap: wrap; gap: 4px; }
+.rv-chip {
+  font-size: 11px; padding: 1px 7px; border-radius: 20px;
+  background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+}
+.rv-chip.changed { border-color: var(--accent); color: var(--text); }
+
 @media (max-width: 980px) {
   .layout { grid-template-columns: 1fr; }
 }
