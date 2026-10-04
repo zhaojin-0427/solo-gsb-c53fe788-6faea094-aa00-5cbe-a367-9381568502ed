@@ -25,7 +25,7 @@ from .solver import (
     run_solve,
     scan_schedule,
 )
-from .batch import EarlyTimeReject, Report, evaluate_warning
+from .batch import EarlyTimeReject, Report, diff_warnings, evaluate_warning
 from .storage import Store
 
 DB_PATH = os.environ.get("DCC_DB_PATH", "data/console.db")
@@ -221,6 +221,12 @@ def _batch_summary(row: dict) -> dict:
              "revision": r["revision"], "reported_at": r["reported_at"]}
             for r in row["reports"]
         ],
+        "events": [
+            {"seq": e["seq"], "sortie_id": e["sortie_id"],
+             "actual_offset": e["actual_offset"], "revision": e["revision"],
+             "created_at": e["created_at"]}
+            for e in row["events"]
+        ],
     }
 
 
@@ -325,6 +331,62 @@ def batch_warning(bid: int, t: int):
         )
     summary = _batch_summary(row)
     return {**summary, "warning": result}
+
+
+@app.get("/api/batches/{bid}/replay/{node}")
+def batch_replay(bid: int, node: int, t: int):
+    """Warning-change replay around one accepted report node.
+
+    Restores the complete report states immediately before/after the node
+    from SQLite, evaluates the continuous-time warning on both at the same
+    ``t`` and returns the per-pair added/resolved conflict intervals, the
+    first-conflict times and the overdue changes.  A ``t`` earlier than any
+    reported actual take-off on either side rejects the whole replay with
+    the same rule (and shape) as the warning endpoint; unknown nodes 404.
+    """
+    row = store.get_batch(bid)
+    if row is None:
+        raise HTTPException(404, "batch not found")
+    event = store.get_report_event(bid, node)
+    if event is None:
+        raise HTTPException(404, "report node not found")
+    if t < 0:
+        raise HTTPException(400, "t must be a non-negative integer second")
+    sorties, _ = _build_batch(row)
+    plan = row["plan"]["offsets"]
+    radius, height = row["safety_radius"], row["safety_height"]
+    warnings = {}
+    for side, snapshot in (("before", event["before"]), ("after", event["after"])):
+        reports = {
+            r["sortie_id"]: Report(r["actual_offset"], r["revision"])
+            for r in snapshot
+        }
+        try:
+            warnings[side] = evaluate_warning(
+                sorties, plan, reports, radius, height, t)
+        except EarlyTimeReject as exc:
+            raise HTTPException(
+                400,
+                detail={
+                    "reason": "t_before_reported_takeoff",
+                    "t": t,
+                    "side": side,
+                    "violations": exc.violations,
+                },
+            )
+    return {
+        "batch_id": bid,
+        "node": {"seq": event["seq"], "sortie_id": event["sortie_id"],
+                 "actual_offset": event["actual_offset"],
+                 "revision": event["revision"],
+                 "created_at": event["created_at"]},
+        "t": t,
+        "reports_before": event["before"],
+        "reports_after": event["after"],
+        "before": warnings["before"],
+        "after": warnings["after"],
+        "diff": diff_warnings(warnings["before"], warnings["after"]),
+    }
 
 
 @app.get("/api/health")

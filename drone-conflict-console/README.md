@@ -39,6 +39,16 @@
   上报实际起飞时刻则拒绝；已上报按实际起飞、未上报且计划起飞不早于 `t` 按计划
   起飞、其余标为**逾期**并排除预测（结果标明“预测不完整”）；沿用连续时间冲突
   判定返回 `t` 及之后的冲突区间、首个冲突时刻与已上报架次的偏离计划秒数。
+- **预警变更复盘**：每次**被接受**的上报在**同一数据库事务**内落一个复盘节点
+  （按架次严格递增的提交序号 + 该次写入前后完整上报状态快照），因此上报写入与
+  节点天然原子对应，多进程共库时节点顺序即实际提交顺序；同号同值重试、同号异值、
+  旧号等未被接受的写入**不产生节点**。任选一个已接受的上报节点与非负当前秒 `t`
+  即可复盘：从 SQLite 还原该节点前后完整上报状态，用**同一个 `t`** 分别评估连续
+  时间预警，按架次对列出**新增**与**解除**的冲突时间段（两区间相交时只标变化的
+  部分），并给出前后首个冲突时刻、逾期架次变化与预测完整性变化，同时标明触发
+  本次变更的架次与修订号。`t` 早于任一侧已上报的实际起飞时刻时按现有规则**整次
+  拒绝**（不返回差异）；未知节点返回 `404`。升级前已存在的批次不补造历史节点：
+  其首个升级后节点的“前状态”即升级时可知的最新状态。
 - **可视化对照**：
   - 水平航迹图（最早起飞虚线 / 求解后实线，冲突见证点用红色 ✕ 与安全圆标出）；
   - 甘特式时间轴（红色段为最早起飞时的冲突时间）；
@@ -58,14 +68,14 @@ drone-conflict-console/
 │   ├── model.py         # 航迹/航段数据模型
 │   ├── geometry.py      # 连续冲突检测 + 互斥时差解析几何
 │   ├── solver.py        # OR-Tools CP-SAT 建模、字典序择优、无解核枚举
-│   ├── batch.py         # 批次预警纯逻辑：状态分类 + 连续时间冲突投影
+│   ├── batch.py         # 批次预警纯逻辑：状态分类 + 连续时间冲突投影 + 复盘差异
 │   ├── schemas.py       # 导入/求解/上报请求的校验
-│   ├── storage.py       # SQLite 持久化（场景、方案、批次、上报）
+│   ├── storage.py       # SQLite 持久化（场景、方案、批次、上报、复盘节点）
 │   └── static/          # 原生 JS + Canvas 前端（无构建步骤）
 ├── examples/crossroads.json
 ├── scripts/
-│   └── verify_multiprocess.py  # 双进程共库并发上报的 HTTP 级验证脚本
-├── tests/               # 几何交叉验证 + 求解器暴力验证 + 批次/预警语义
+│   └── verify_multiprocess.py  # 双进程共库并发上报与复盘节点的 HTTP 级验证脚本
+├── tests/               # 几何交叉验证 + 求解器暴力验证 + 批次/预警语义 + 复盘
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
@@ -121,7 +131,10 @@ python3 scripts/verify_multiprocess.py
 脚本覆盖：修订 3 先提交时，另一进程提交修订 2 返回 `409 stale_revision` 且
 `current_revision=3`；修订 2 先提交时，修订 3 仍可更新；两个进程**同时**提交
 2 与 3（多轮，含两种提交先后）后，批次详情、页面数据与预警一律使用最高修订 3
-的实际偏移；以及并发首报按同号规则处理（同值一插一幂等）。
+的实际偏移；以及并发首报按同号规则处理（同值一插一幂等）。每个用例还会核对
+**复盘节点**：被接受的写入按实际提交顺序生成节点（修订 2 先提交则节点为
+`[1,2,3]`，修订 3 先提交则修订 2 被拒、节点为 `[1,3]`），前后状态快照逐节点
+衔接，且从两个进程分别复盘最新节点结果完全一致。
 结束后 `docker compose --profile multiproc down` 停止两个进程。
 
 ---
@@ -164,6 +177,10 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
    - 填写 **当前秒 t**，点 **评估预警**：状态徽标显示“已上报 / 按计划 / 逾期”，
      面板给出预测是否完整、首个冲突时刻、各已上报架次偏离计划秒数，以及 `t` 及
      之后的连续时间冲突区间。页面与 HTTP API 读写同一批次数据。
+   - 下方 **预警变更复盘** 中选择一个已接受的上报节点（下拉框按提交顺序列出，
+     默认最新），点 **复盘该节点**：用上方同一个 `t` 对比该节点前后预警，显示
+     触发架次与修订号、前后首个冲突时刻、逾期变化，以及按架次对列出的新增 /
+     解除冲突时间段（相交区间只标变化部分）。
 
 ---
 
@@ -234,10 +251,11 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | `DELETE` | `/api/scenarios/{id}` | 删除 |
 | `POST` | `/api/scenarios/{id}/batches` | 从可行方案创建执行批次（冻结快照/阈值/计划） |
 | `GET` | `/api/batches?scenario_id=` | 批次列表（可按场景过滤） |
-| `GET` | `/api/batches/{id}` | 批次详情（冻结计划 + 全部上报） |
+| `GET` | `/api/batches/{id}` | 批次详情（冻结计划 + 全部上报 + 复盘节点列表） |
 | `DELETE` | `/api/batches/{id}` | 删除批次及其上报 |
 | `PUT` | `/api/batches/{id}/reports` | 上报某架次实际起飞偏移与修订号（幂等/冲突，多进程共库也按数据库级规则裁决） |
 | `GET` | `/api/batches/{id}/warning?t=` | 在非负当前秒 `t` 评估偏差预警 |
+| `GET` | `/api/batches/{id}/replay/{node}?t=` | 复盘第 `node` 个已接受上报节点：同一 `t` 下前后预警差异（未知节点 404） |
 | `GET` | `/api/health` | 健康检查 |
 
 命令行示例：
@@ -450,6 +468,104 @@ curl -s "http://localhost:8000/api/batches/2/warning?t=4"
 **批次重载**（`GET /api/batches/2` 后重新 `warning`）结果完全一致——预警是冻结
 批次与已存上报的纯函数。
 
+### 5) 预警变更复盘（按上报节点对比前后预警）
+
+每次**被接受**的上报都会留下一个复盘节点；批次详情的 `events` 字段按提交顺序
+列出（接第 4 节的批次 2，其三次上报即节点 #1~#3）：
+
+```bash
+# 对 B 再发更高修订号纠错：实际偏移 4 -> 2（生成节点 #4）
+curl -s -X PUT http://localhost:8000/api/batches/2/reports -H 'Content-Type: application/json' \
+  -d '{"sortie_id":"UAV-B","actual_offset":2,"revision":2}'
+
+curl -s http://localhost:8000/api/batches/2 | python3 -m json.tool
+```
+
+```json
+"events":[
+  {"seq":1,"sortie_id":"UAV-A","actual_offset":4,"revision":1,"created_at":...},
+  {"seq":2,"sortie_id":"UAV-B","actual_offset":4,"revision":1,"created_at":...},
+  {"seq":3,"sortie_id":"UAV-C","actual_offset":2,"revision":1,"created_at":...},
+  {"seq":4,"sortie_id":"UAV-B","actual_offset":2,"revision":2,"created_at":...}]
+```
+
+复盘节点 #4（B 由 4 纠正为 2）：前后完整上报状态从 SQLite 还原，两侧用**同一个
+`t=4`** 评估连续时间预警；`node` 标明触发本次变更的架次与修订号：
+
+```bash
+curl -s "http://localhost:8000/api/batches/2/replay/4?t=4" | python3 -m json.tool
+```
+
+```json
+{"batch_id":2,
+ "node":{"seq":4,"sortie_id":"UAV-B","actual_offset":2,"revision":2,"created_at":...},
+ "t":4,
+ "reports_before":[{"sortie_id":"UAV-A","actual_offset":4,"revision":1},
+                   {"sortie_id":"UAV-B","actual_offset":4,"revision":1},
+                   {"sortie_id":"UAV-C","actual_offset":2,"revision":1}],
+ "reports_after": [{"sortie_id":"UAV-A","actual_offset":4,"revision":1},
+                   {"sortie_id":"UAV-B","actual_offset":2,"revision":2},
+                   {"sortie_id":"UAV-C","actual_offset":2,"revision":1}],
+ "before":{"t":4, "...": "完整预警（结构同 /warning）",
+           "conflicts":[{"sortie_a":"UAV-B","sortie_b":"UAV-C","time_start":9.942324,"time_end":12.519215,"...":"..."},
+                        {"sortie_a":"UAV-B","sortie_b":"UAV-D","time_start":12.335899,"time_end":15.664101,"...":"..."}]},
+ "after": {"t":4, "...": "...",
+           "conflicts":[{"sortie_a":"UAV-B","sortie_b":"UAV-C","time_start":9.528191,"time_end":11.394886,"...":"..."},
+                        {"sortie_a":"UAV-B","sortie_b":"UAV-D","time_start":12.0,"time_end":14.0,"...":"..."}]},
+ "diff":{
+   "pairs":[
+     {"sortie_a":"UAV-B","sortie_b":"UAV-C",
+      "added":[[9.528191,9.942324]],"resolved":[[11.394886,12.519215]]},
+     {"sortie_a":"UAV-B","sortie_b":"UAV-D",
+      "added":[[12.0,12.335899]],"resolved":[[14.0,15.664101]]}],
+   "first_conflict_time_before":9.942324,"first_conflict_time_after":9.528191,
+   "complete_before":true,"complete_after":true,
+   "overdue_before":[],"overdue_after":[],
+   "overdue_added":[],"overdue_resolved":[]}}
+```
+
+注意 B↔C 的冲突区间由 `[9.942324, 12.519215]` 变为 `[9.528191, 11.394886]`：两段
+区间相交，差异里**只标变化部分**——新增 `[9.528191, 9.942324]`、解除
+`[11.394886, 12.519215]`，相交的公共部分不重复出现；B↔D 同理。
+
+复盘节点 #2（B 首次上报偏离 +4 秒）在 `t=4`：冲突 B↔D 整段**新增**，同时 B 由
+“逾期”变为“已上报”（逾期解除），预测完整性也随之变化：
+
+```bash
+curl -s "http://localhost:8000/api/batches/2/replay/2?t=4" | python3 -c \
+  "import json,sys; print(json.dumps(json.load(sys.stdin)['diff'],indent=1))"
+```
+
+```json
+{"pairs":[{"sortie_a":"UAV-B","sortie_b":"UAV-D",
+           "added":[[12.335899,15.664101]],"resolved":[]}],
+ "first_conflict_time_before":null,"first_conflict_time_after":12.335899,
+ "complete_before":false,"complete_after":false,
+ "overdue_before":["UAV-B","UAV-C"],"overdue_after":["UAV-C"],
+ "overdue_added":[],"overdue_resolved":["UAV-B"]}
+```
+
+`t` 早于**任一侧**已上报的实际起飞时刻时，按与 `/warning` 相同的规则**整次
+拒绝**（不返回差异，`side` 标明触发拒绝的一侧）；未知节点返回 `404`：
+
+```bash
+curl -i "http://localhost:8000/api/batches/2/replay/4?t=1"
+# HTTP/1.1 400 Bad Request
+# {"detail":{"reason":"t_before_reported_takeoff","t":1,"side":"before",
+#            "violations":[{"sortie_id":"UAV-A","actual_takeoff":4},
+#                          {"sortie_id":"UAV-B","actual_takeoff":4},
+#                          {"sortie_id":"UAV-C","actual_takeoff":2}]}}
+curl -i "http://localhost:8000/api/batches/2/replay/99?t=4"
+# HTTP/1.1 404 Not Found
+# {"detail":"report node not found"}
+```
+
+节点规则：同号同值重试（幂等）、同号异值、旧号、首版非 1 等**未被接受**的写入
+都不产生节点；并发升版时节点顺序即实际提交顺序（修订 2 先提交则节点为
+`[…, 2, 3]`，修订 3 先提交则修订 2 被拒、不留节点）；复盘是冻结批次与已存节点
+的纯函数，重载后结果一致。升级前已存在的批次没有历史节点，其首个升级后节点
+的“前状态”就是升级时可知的最新状态，更早的记录不补造。
+
 ---
 
 ## 测试
@@ -461,6 +577,7 @@ pip install -r requirements.txt
 python tests/test_geometry_crossval.py     # 几何：解析法 vs 连续扫描 vs 密采样
 python tests/test_solver_bruteforce.py 2026  # 求解器：对照暴力枚举（含无解核极小性）
 python tests/test_batches_warning.py       # 批次：修订协议/多进程共库并发/预警分类与冲突
+python tests/test_replay.py                # 复盘：节点规则/提交顺序/区间差异/HTTP 语义
 ```
 
 - `test_geometry_crossval.py` 用三套相互独立的实现（多边形/椭圆柱解析、
@@ -471,7 +588,13 @@ python tests/test_batches_warning.py       # 批次：修订协议/多进程共�
   **两个 OS 进程共享同一 SQLite 文件时并发上报仍只留最高修订号**（用
   `multiprocessing` 真起两个进程对同一文件做条件写入，含修订 2/3 竞争与
   并发首报），以及预警的拒绝、已上报/按计划/逾期分类、不完整标记、连续时间
-  冲突区间向 `t` 投影与“重载结果一致”。
+  冲突区间向 `t` 投影与“重载结果一致”；
+- `test_replay.py` 验证复盘节点与上报写入的原子对应（被接受才落节点、同号同值
+  重试与被拒修订不留节点、前后状态快照逐节点衔接）、既有批次以升级时最新状态
+  为基线且不补造历史、线程与**两个 OS 进程**并发升版时节点按实际提交顺序排列、
+  区间集合差（相交只标变化部分、点区间、端点相接）、逾期变化与首个冲突时刻，
+  以及 HTTP 层的未知节点 404、负 `t` 400、任一侧过早 `t` 整次拒绝、现有上报
+  响应与最新预警保持兼容、重载复盘一致。
 
 ---
 
@@ -493,3 +616,15 @@ python tests/test_batches_warning.py       # 批次：修订协议/多进程共�
   设置了忙等待，上报用条件写入仲裁，并发修订不会回退（可用
   `docker compose --profile multiproc up` 起两个进程并运行
   `scripts/verify_multiprocess.py` 验证）。
+- 复盘节点（`report_events` 表）与上报写入在**同一个 `BEGIN IMMEDIATE` 事务**内
+  提交：写入前先在写锁保护下读取完整上报状态作为“前状态”快照，条件写入后再读
+  出“后状态”快照，节点序号 `seq` 按 `MAX(seq)+1` 在持锁期间分配，因此跨进程共库
+  时节点顺序就是实际提交顺序，且上报行与节点要么同时可见、要么都不可见；未被
+  接受的写入（幂等重试、同号异值、旧号、首版非 1）不执行任何写，自然不留节点。
+- 复盘接口 `GET /api/batches/{id}/replay/{node}?t=` 只读取冻结批次与已存节点：
+  前后两侧用**同一个非负整数 `t`** 评估；任一侧出现“`t` 早于已上报实际起飞”
+  即整次 `400` 拒绝（响应带 `side` 标明是哪一侧，不含差异）；节点不存在返回
+  `404`；差异按架次对给出新增/解除的连续时间区间，相交区间只保留变化部分
+  （端点相接不算相交），并附前后首个冲突时刻、逾期集合变化与预测完整性变化。
+- 升级前已存在的批次没有复盘节点，也不会补造：其升级后首个被接受的上报所生成
+  的节点，以当时（即升级时可知的）最新上报状态为“前状态”基线。

@@ -162,6 +162,10 @@ canvas {
   flex: 1; background: #0e1525; color: var(--text);
   border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px;
 }
+.t-row select {
+  flex: 1; min-width: 0; background: #0e1525; color: var(--text);
+  border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px;
+}
 .t-row button { padding: 7px 10px; }
 .warn-summary { font-size: 12px; margin: 6px 0; display: flex; flex-direction: column; gap: 3px; }
 .warn-summary .bad { color: var(--bad); font-weight: 600; }
@@ -195,6 +199,13 @@ canvas {
   padding: 5px 8px; margin-bottom: 4px; font-variant-numeric: tabular-nums;
 }
 .batch-item.active { border-color: var(--accent); }
+
+/* warning-change replay */
+.replay-result { font-size: 12px; margin-top: 6px; }
+.replay-result .rp-head { font-weight: 600; margin-bottom: 6px; color: #cdd9f0; }
+.replay-result .kv { margin-top: 3px; }
+.rp-add { color: var(--bad); font-weight: 600; }
+.rp-del { color: var(--ok); font-weight: 600; }
 
 @media (max-width: 980px) {
   .layout { grid-template-columns: 1fr; }

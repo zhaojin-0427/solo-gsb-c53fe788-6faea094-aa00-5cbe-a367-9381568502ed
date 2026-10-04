@@ -22,6 +22,8 @@ const state = {
   batch: null,           // currently open batch summary + warning
   warning: null,
   warningSorties: {},    // latest warning rows keyed by sortie id
+  replay: null,          // latest replay DTO for the open batch
+  replayNodeSeq: null,   // selected replay node (per-batch commit order)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -80,6 +82,8 @@ function loadScenarioDto(dto) {
   state.batch = null;
   state.warning = null;
   state.warningSorties = {};
+  state.replay = null;
+  state.replayNodeSeq = null;
   state.sorties.forEach((s) => colorFor(s.id));
   $("safetyRadius").value = dto.safety_radius;
   $("safetyHeight").value = dto.safety_height;
@@ -691,6 +695,8 @@ async function openBatch(bid) {
     state.batch = b;
     state.warning = null;
     state.warningSorties = {};
+    state.replay = null;
+    state.replayNodeSeq = null;
     renderBatchList();
     renderBatchDetail();
   } catch (e) {
@@ -705,6 +711,8 @@ async function deleteBatch(bid) {
     state.batch = null;
     state.warning = null;
     state.warningSorties = {};
+    state.replay = null;
+    state.replayNodeSeq = null;
   }
   toast("批次已删除");
   await fetchBatches();
@@ -757,6 +765,101 @@ async function evaluateWarning() {
     renderBatchDetail();
     toast("评估被拒绝：" + e.message, 4200);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Warning-change replay around one accepted report node
+// ---------------------------------------------------------------------------
+
+async function replayNode() {
+  if (!state.batch) return;
+  const seq = parseInt($("replayNode").value, 10);
+  if (!Number.isInteger(seq)) {
+    toast("请先选择一个已接受的上报节点");
+    return;
+  }
+  const t = parseInt($("warnT").value, 10);
+  if (!Number.isInteger(t) || t < 0) {
+    toast("t 必须是非负整数秒");
+    return;
+  }
+  try {
+    state.replay = await api(`/api/batches/${state.batch.batch_id}/replay/${seq}?t=${t}`);
+    renderReplay();
+  } catch (e) {
+    state.replay = null;
+    renderReplay();
+    toast("复盘被拒绝：" + e.message, 4600);
+  }
+}
+
+function renderReplayNodeSelect() {
+  const sel = $("replayNode");
+  const btn = $("replayBtn");
+  const events = (state.batch && state.batch.events) || [];
+  sel.innerHTML = "";
+  for (const e of events) {
+    const opt = document.createElement("option");
+    opt.value = e.seq;
+    opt.textContent = `#${e.seq} · ${e.sortie_id} · 修订 ${e.revision} · 实际 ${e.actual_offset}s`;
+    sel.appendChild(opt);
+  }
+  if (!events.length) {
+    state.replayNodeSeq = null;
+    btn.disabled = true;
+    return;
+  }
+  // Keep the previous selection when it still exists; default to the newest.
+  const still = events.some((e) => e.seq === state.replayNodeSeq);
+  state.replayNodeSeq = still ? state.replayNodeSeq : events[events.length - 1].seq;
+  sel.value = String(state.replayNodeSeq);
+  btn.disabled = false;
+}
+
+function fmtTimeOrNone(v) {
+  return v === null || v === undefined ? "无" : `${v} s`;
+}
+
+function renderReplay() {
+  const box = $("replayResult");
+  const d = state.replay;
+  if (!d) {
+    const has = state.batch && (state.batch.events || []).length;
+    box.innerHTML = `<div class="hint">${has
+      ? "选择节点后点“复盘该节点”。"
+      : "尚无已接受的上报节点；被接受的上报会按提交顺序生成节点。"}</div>`;
+    return;
+  }
+  const n = d.node;
+  const diff = d.diff;
+  const fmtIvs = (ivs) => ivs.map(([s, e]) => `[${s}, ${e}]`).join("，");
+  const overdue = [];
+  if (diff.overdue_added.length) {
+    overdue.push(`新增逾期 ${diff.overdue_added.map(escapeHtml).join("、")}`);
+  }
+  if (diff.overdue_resolved.length) {
+    overdue.push(`解除逾期 ${diff.overdue_resolved.map(escapeHtml).join("、")}`);
+  }
+  let html = `
+    <div class="rp-head">节点 #${n.seq}：${escapeHtml(n.sortie_id)} 修订 ${n.revision}
+      → 实际偏移 ${n.actual_offset}s（前后均按 t=${d.t}s 评估）</div>
+    <div class="kv"><span>首个冲突时刻</span><b>${fmtTimeOrNone(diff.first_conflict_time_before)}
+      → ${fmtTimeOrNone(diff.first_conflict_time_after)}</b></div>
+    <div class="kv"><span>预测完整性</span><b>${diff.complete_before ? "完整" : "不完整"}
+      → ${diff.complete_after ? "完整" : "不完整"}</b></div>
+    <div class="kv"><span>逾期变化</span><b>${overdue.length ? overdue.join("；") : "无"}</b></div>`;
+  if (!diff.pairs.length) {
+    html += `<div class="wc-none" style="margin-top:6px">各架次对的冲突时间段无变化。</div>`;
+  } else {
+    html += `<div class="wc-title" style="margin-top:6px">冲突时间段变化（仅变化部分，秒）</div>`;
+    for (const p of diff.pairs) {
+      const parts = [];
+      if (p.added.length) parts.push(`<span class="rp-add">新增 ${fmtIvs(p.added)}</span>`);
+      if (p.resolved.length) parts.push(`<span class="rp-del">解除 ${fmtIvs(p.resolved)}</span>`);
+      html += `<div class="wc-line">${escapeHtml(p.sortie_a)} ↔ ${escapeHtml(p.sortie_b)}：${parts.join("；")}</div>`;
+    }
+  }
+  box.innerHTML = html;
 }
 
 function renderBatchList() {
@@ -832,6 +935,9 @@ function renderBatchDetail() {
     btn.addEventListener("click", () => submitReport(btn.getAttribute("data-report")));
   });
 
+  renderReplayNodeSelect();
+  renderReplay();
+
   const sum = $("warnSummary");
   const cf = $("warnConflicts");
   if (!state.warning) {
@@ -905,6 +1011,10 @@ $("closeResult").addEventListener("click", () => $("resultPanel").classList.add(
 $("createBatchBtn").addEventListener("click", createBatch);
 $("evalWarnBtn").addEventListener("click", evaluateWarning);
 $("warnT").addEventListener("keydown", (e) => { if (e.key === "Enter") evaluateWarning(); });
+$("replayBtn").addEventListener("click", replayNode);
+$("replayNode").addEventListener("change", (e) => {
+  state.replayNodeSeq = parseInt(e.target.value, 10);
+});
 $("batchDel").addEventListener("click", () => {
   if (state.batch) deleteBatch(state.batch.batch_id);
 });

@@ -86,6 +86,19 @@
         <div id="warnSummary" class="warn-summary"></div>
         <div id="warnSorties" class="warn-sorties"></div>
         <div id="warnConflicts" class="warn-conflicts"></div>
+
+        <div id="replaySection" style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
+          <div class="hint">预警变更复盘：选择一次已接受的上报节点，用上方同一个当前秒 t
+            对比该节点前后的完整预警（新增 / 解除的冲突时间段只标变化部分）。</div>
+          <div class="row">
+            <label>上报节点（按实际提交顺序）</label>
+            <div class="t-row">
+              <select id="replayNode"></select>
+              <button id="replayBtn" disabled>复盘该节点</button>
+            </div>
+          </div>
+          <div id="replayResult" class="replay-result"></div>
+        </div>
       </div>
     </section>
   </aside>

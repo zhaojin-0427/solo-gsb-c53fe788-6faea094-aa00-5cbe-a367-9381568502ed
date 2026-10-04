@@ -23,8 +23,11 @@ batches and then exercises the revision protocol *across the two processes*:
   one insert and one idempotent retry.
 
 After every case it reloads the batch (and its warning) from BOTH processes
-and checks they show the highest revision's actual offset. Exits non-zero on
-the first failed expectation.
+and checks they show the highest revision's actual offset.  It also verifies
+the replay nodes: accepted writes appear as nodes in actual commit order
+(rejected ones never do), each node's before/after snapshots chain into the
+next, and replaying the newest node from either process returns identical
+results. Exits non-zero on the first failed expectation.
 """
 
 from __future__ import annotations
@@ -116,6 +119,29 @@ def stored_report(base, bid, sortie):
     return rows.get(sortie)
 
 
+def check_replay_nodes(case_name, bid, expect_revisions):
+    """The replay nodes must match the accepted writes in commit order and
+    replay identically from both processes."""
+    status, body = call("GET", BASE1, f"/api/batches/{bid}")
+    events = body["events"]
+    check([e["revision"] for e in events] == expect_revisions
+          and [e["seq"] for e in events] == list(range(1, len(events) + 1)),
+          f"{case_name}: nodes are the accepted revisions in commit order "
+          f"{expect_revisions} -> {events}")
+    if not events:
+        return
+    last = events[-1]["seq"]
+    # Any t at or after every reported take-off on both sides is accepted.
+    t = max(e["actual_offset"] for e in events)
+    r1 = call("GET", BASE1, f"/api/batches/{bid}/replay/{last}?t={t}")
+    r2 = call("GET", BASE2, f"/api/batches/{bid}/replay/{last}?t={t}")
+    check(r1[0] == 200 and r2[0] == 200 and r1[1] == r2[1],
+          f"{case_name}: replay of node {last} identical on both processes")
+    node = r1[1]["node"]
+    check(node["seq"] == last and node["revision"] == expect_revisions[-1],
+          f"{case_name}: newest node carries its triggering revision -> {node}")
+
+
 def warning_row(base, bid, t):
     status, body = call("GET", base, f"/api/batches/{bid}/warning?t={t}")
     assert status == 200, (status, body)
@@ -179,6 +205,11 @@ def main():
     assert_final("A", bid_a)
     assert_final("B", bid_b)
 
+    # Replay nodes: exactly the accepted writes, in commit order (case A's
+    # stale revision 2 left no node), identical from both processes.
+    check_replay_nodes("A", bid_a, [1, 3])
+    check_replay_nodes("B", bid_b, [1, 2, 3])
+
     # --- case C: simultaneous rev 2 vs rev 3, repeated ---------------------
     for trial in range(5):
         cb = new_batch(sid, f"caseC-race-{trial}")
@@ -204,6 +235,11 @@ def main():
         rep = stored_report(BASE1, cb, "UAV-A")
         check(rep["revision"] == 3 and rep["actual_offset"] == 9,
               f"C{trial}: final row always rev 3 / offset 9 -> {rep}")
+        # Nodes follow the actual commit order: rev 2 either committed first
+        # (two race nodes) or lost to a committed 3 (no node for it).
+        rev2_committed_first = r2[0][0] == 200
+        check_replay_nodes(f"C{trial}", cb,
+                           [1, 2, 3] if rev2_committed_first else [1, 3])
 
     # --- case D: simultaneous first reports, same value --------------------
     db = new_batch(sid, "caseD-first-same")
@@ -216,6 +252,7 @@ def main():
     rep = stored_report(BASE2, db, "UAV-A")
     check(rep is not None and rep["revision"] == 1 and rep["actual_offset"] == 7,
           f"D: single rev 1 / offset 7 row visible on process 2 -> {rep}")
+    check_replay_nodes("D", db, [1])
 
     print()
     if FAILURES:

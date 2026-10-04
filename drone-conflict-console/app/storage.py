@@ -3,6 +3,11 @@
 A *scenario* keeps the exact imported JSON (input snapshot) together with the
 safety parameters used for the most recent solve, so saved plans can always be
 reopened and compared against their original input.
+
+Execution *batches* freeze one feasible plan; accepted actual-take-off reports
+additionally append replay *nodes* (complete before/after report-state
+snapshots in commit order) so any accepted report can later be reviewed as a
+warning-change replay.
 """
 
 from __future__ import annotations
@@ -54,6 +59,24 @@ CREATE TABLE IF NOT EXISTS batch_reports (
     revision        INTEGER NOT NULL CHECK (revision >= 1),
     reported_at     REAL NOT NULL,
     PRIMARY KEY (batch_id, sortie_id)
+);
+
+-- Replay nodes: one row per ACCEPTED report write, recorded in the same
+-- transaction as the write itself.  ``seq`` is the per-batch commit order;
+-- ``before_json``/``after_json`` snapshot the complete report state of the
+-- batch immediately before/after that write, so a replay can restore both
+-- sides of the node without any other table.
+CREATE TABLE IF NOT EXISTS report_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL,
+    sortie_id       TEXT NOT NULL,
+    actual_offset   INTEGER NOT NULL,
+    revision        INTEGER NOT NULL,
+    before_json     TEXT NOT NULL,
+    after_json      TEXT NOT NULL,
+    created_at      REAL NOT NULL,
+    UNIQUE (batch_id, seq)
 );
 """
 
@@ -168,6 +191,9 @@ class Store:
         with self._write_tx() as c:
             # Remove dependent batches (and their reports) explicitly so the
             # cascade works even on databases created before the FK cascade.
+            c.execute("DELETE FROM report_events WHERE batch_id IN "
+                      "(SELECT id FROM batches WHERE scenario_id=?)",
+                      (scenario_id,))
             c.execute("DELETE FROM batch_reports WHERE batch_id IN "
                       "(SELECT id FROM batches WHERE scenario_id=?)",
                       (scenario_id,))
@@ -219,13 +245,61 @@ class Store:
                 "FROM batch_reports WHERE batch_id=? ORDER BY sortie_id",
                 (batch_id,),
             ).fetchall()
+            events = c.execute(
+                "SELECT seq,sortie_id,actual_offset,revision,created_at "
+                "FROM report_events WHERE batch_id=? ORDER BY seq",
+                (batch_id,),
+            ).fetchall()
         d["reports"] = [dict(r) for r in reports]
+        d["events"] = [dict(r) for r in events]
         return d
 
     def delete_batch(self, batch_id: int) -> bool:
         with self._write_tx() as c:
+            c.execute("DELETE FROM report_events WHERE batch_id=?", (batch_id,))
+            c.execute("DELETE FROM batch_reports WHERE batch_id=?", (batch_id,))
             cur = c.execute("DELETE FROM batches WHERE id=?", (batch_id,))
             return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Replay nodes (accepted-report history with before/after snapshots)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _report_state(c, batch_id: int) -> list[dict]:
+        """Complete report state of a batch, read inside transaction ``c``."""
+        rows = c.execute(
+            "SELECT sortie_id,actual_offset,revision FROM batch_reports "
+            "WHERE batch_id=? ORDER BY sortie_id",
+            (batch_id,),
+        ).fetchall()
+        return [{"sortie_id": r["sortie_id"],
+                 "actual_offset": r["actual_offset"],
+                 "revision": r["revision"]} for r in rows]
+
+    def get_report_events(self, batch_id: int) -> list[dict]:
+        """Lightweight list of replay nodes in commit order (no snapshots)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT seq,sortie_id,actual_offset,revision,created_at "
+                "FROM report_events WHERE batch_id=? ORDER BY seq",
+                (batch_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_report_event(self, batch_id: int, seq: int) -> dict | None:
+        """One replay node with its before/after report-state snapshots."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM report_events WHERE batch_id=? AND seq=?",
+                (batch_id, seq),
+            ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["before"] = json.loads(d.pop("before_json"))
+        d["after"] = json.loads(d.pop("after_json"))
+        return d
 
     def submit_report(self, batch_id: int, sortie_id: str,
                       actual_offset: int, revision: int) -> tuple[str, dict | None]:
@@ -255,10 +329,26 @@ class Store:
         * revision  < stored revision  -> ``stale_revision``
         * revision  > stored revision  -> ``inserted``
 
+        Every accepted write additionally appends one replay node to
+        ``report_events`` *inside the same transaction*: the complete report
+        state is snapshotted just before and just after the conditional
+        write, and the per-batch ``seq`` (``MAX(seq)+1``) is allocated while
+        the write lock is held, so node order is exactly the commit order —
+        also when several processes share the database file.  Outcomes that
+        write nothing (idempotent retries, stale/conflicting/invalid
+        revisions) create no node, and a batch created before replay nodes
+        existed simply starts its node list at the first post-upgrade
+        accepted report, whose ``before`` snapshot is the latest state known
+        at upgrade time (no earlier history is fabricated).
+
         Returns ``(outcome, info)``.
         """
         with self._write_tx() as c:
             now = time.time()
+            # Snapshot the pre-write state first: BEGIN IMMEDIATE already
+            # holds the reserved lock, so no peer can commit between this
+            # read and the conditional writes below.
+            before = self._report_state(c, batch_id)
             # 1) First report only: create the row when none exists AND the
             #    incoming revision is 1.
             cur = c.execute(
@@ -280,6 +370,20 @@ class Store:
                 )
                 wrote = cur.rowcount > 0
             if wrote:
+                after = self._report_state(c, batch_id)
+                seq = c.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM report_events "
+                    "WHERE batch_id=?",
+                    (batch_id,),
+                ).fetchone()["n"]
+                c.execute(
+                    "INSERT INTO report_events(batch_id,seq,sortie_id,"
+                    "actual_offset,revision,before_json,after_json,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (batch_id, seq, sortie_id, int(actual_offset), int(revision),
+                     json.dumps(before, ensure_ascii=False),
+                     json.dumps(after, ensure_ascii=False), now),
+                )
                 return "inserted", {"sortie_id": sortie_id,
                                     "actual_offset": int(actual_offset),
                                     "revision": int(revision)}
